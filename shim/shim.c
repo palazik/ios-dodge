@@ -59,7 +59,22 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
+
+/*
+ * The OnePlus 13's real MPIDRs, from its device tree: six performance Oryon
+ * cores in cluster 0 (Aff1 0-5) and two prime ("gold") Oryon cores in cluster
+ * 1, at 0x10000 and 0x10100. test_smp() below sweeps i<<8, which names
+ * 0x600 and 0x700 - MPIDRs this SoC does not have - so the two prime cores
+ * have never actually been started or read.
+ */
+static const uint32_t cpu_mpidr[NR_CPUS] = {
+	0x00000, 0x00100, 0x00200, 0x00300, 0x00400, 0x00500, 0x10000, 0x10100,
+};
+
 static volatile uint64_t sec_mpidr[NR_CPUS];
+static volatile uint64_t sec_mmfr0[NR_CPUS];
+/* While set, a secondary only reports its ID registers and powers back off. */
+static volatile int sec_id_only = 1;
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
@@ -167,7 +182,8 @@ static uintptr_t find_gicr(void);
 void secondary_main(uint64_t idx)
 {
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
-	if (idx == 1) {
+	sec_mmfr0[idx] = rsr("id_aa64mmfr0_el1");
+	if (!sec_id_only && idx == 1) {
 		uintptr_t r = find_gicr();
 		if (r) {
 			sec_probe[0] = rd32(r + GICR_IGROUPR0);
@@ -180,6 +196,57 @@ void secondary_main(uint64_t idx)
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_CPU_OFF, 0, 0, 0);
+}
+
+/*
+ * Does ANY core implement the 16K translation granule?
+ *
+ * xnu is built for 16K pages, and the boot core reports
+ * ID_AA64MMFR0_EL1.TGran16 == 0, which for this field means "not
+ * implemented" (the neighbouring TGran4/TGran64 fields use the opposite
+ * convention, where 0 means supported). That is why xnu dies the instant it
+ * sets SCTLR_EL1.M. A big.LITTLE SoC is architecturally allowed to differ
+ * here between clusters, and the two prime cores have never been read, so
+ * start every core by its real MPIDR and collect TGran16 from each.
+ *
+ * One line, one nibble per core, cpu7 leftmost:
+ *   tg16  - 0 means that core cannot do 16K; 1 or 2 means it can.
+ *           F means the core never reported (see the CPU_ON return).
+ *   on    - bitmask of cores that answered.
+ */
+static void probe_granule(void)
+{
+	uint64_t self = rsr("mpidr_el1") & 0xffffff;
+	uint32_t tg = 0, on = 0, err = 0;
+
+	stage = "granule";
+	for (int i = 0; i < NR_CPUS; i++) {
+		if (cpu_mpidr[i] == self) {
+			continue;
+		}
+		int64_t rc = smc(PSCI_CPU_ON, cpu_mpidr[i],
+		    (uintptr_t)secondary_entry, i);
+		err |= (uint32_t)(rc & 0xf) << (4 * i);
+	}
+	delay_ms(500);
+
+	for (int i = 0; i < NR_CPUS; i++) {
+		uint64_t mmfr0;
+
+		if (cpu_mpidr[i] == self) {
+			mmfr0 = rsr("id_aa64mmfr0_el1");
+		} else if (sec_mpidr[i]) {
+			mmfr0 = sec_mmfr0[i];
+		} else {
+			tg |= 0xfU << (4 * i);	/* never reported */
+			continue;
+		}
+		on |= 1U << i;
+		tg |= (uint32_t)((mmfr0 >> 20) & 0xf) << (4 * i);
+	}
+	con_hex2("TG16", "cpu7..0=", tg, "on=", on);
+	con_hex2("CPUON", "err7..0=", err, "boot=", (uint32_t)self);
+	delay_ms(200);		/* let the secondaries reach PSCI_CPU_OFF */
 }
 
 static void __attribute__((unused)) test_smp(void)
@@ -402,6 +469,7 @@ void shim_main(uint64_t dtb)
 		__asm__ volatile ("mrs %0, HCR_EL2" : "=r" (hcr));
 		con_hex("HCR_EL2", hcr);
 	}
+	probe_granule();
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
