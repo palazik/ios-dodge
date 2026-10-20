@@ -1,0 +1,136 @@
+From 53f0237df66995f2854a88d19cdc77e15f7744b2 Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 01:08:38 +0500
+Subject: [PATCH] dodge: give each boot-progress stripe its own colour
+
+Colour-coded progress stripes are an idea from KSN2redawew/ios-giuliac,
+which uses magenta/yellow/cyan/green/white boxes to step through its own
+probe.
+
+All nine stripes were white, so reading the result meant counting them
+off a photograph of a phone held at an angle. That has gone wrong twice
+already and in both directions: once reported as two stripes when it was
+two, but described in a way that could equally have meant four, and once
+miscounted by me off a disassembly. With a colour per stage the
+bottom-most stripe names the stage outright, and there is nothing to
+count.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/start.s | 38 ++++++++++++++++++++++++++++----------
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index dede4b3..f1f06c1 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -110,14 +110,32 @@
+  *   7  MMU came on and we are still executing (drawn with it off again)
+  *   8  the same store, now going through the bootstrap tables
+  *
++ * Each stage has its own colour (white, yellow, cyan, green, magenta, orange,
++ * blue, grey, lime), so the bottom-most stripe names the stage directly rather
++ * than having to be counted off a photograph. Colour-coded progress stripes
++ * are an idea from KSN2redawew/ios-giuliac.
++ *
+  * Clobbers x0-x2 only, and uses no stack, so it is safe this early. Works with
+  * the MMU off (plain physical store) and with the bootstrap MMU on, because the
+  * framebuffer is identity-mapped by the block added after create_bootstrap_mapping.
+  */
+ #define DODGE_BAND_ROW0 1200
++
++/* One colour per stage, so the last stripe names the stage instead of having
++ * to be counted. Counting has gone wrong twice already, in both directions. */
++#define DODGE_C0 0xffffffff	/* white   */
++#define DODGE_C1 0xffffff00	/* yellow  */
++#define DODGE_C2 0xff00ffff	/* cyan    */
++#define DODGE_C3 0xff00ff00	/* green   */
++#define DODGE_C4 0xffff00ff	/* magenta */
++#define DODGE_C5 0xffff8000	/* orange  */
++#define DODGE_C6 0xff0000ff	/* blue    */
++#define DODGE_C7 0xff808080	/* grey    */
++#define DODGE_C8 0xff80ff00	/* lime    */
++
+ .macro DODGE_BAND
+ 	MOV64	x0, (0xfc800000 + (DODGE_BAND_ROW0 + $0 * 40) * 5760)
+-	mov		w1, #-1
++	MOV64	x1, $1
+ 	mov		x2, #(32 * 1440)
+ 8:
+ 	str		w1, [x0], #4
+@@ -563,7 +581,7 @@ LEXT(start_first_cpu)
+ 
+ #if defined(DODGE)
+ 	/* Stage 0: reached start_first_cpu. No stack or page tables needed. */
+-	DODGE_BAND 0
++	DODGE_BAND 0, DODGE_C0
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -741,7 +759,7 @@ Lkernelcache_base_found:
+ 
+ #if defined(DODGE)
+ 	/* Stage 1: bootstrap page tables built (incl. the framebuffer block). */
+-	DODGE_BAND 1
++	DODGE_BAND 1, DODGE_C1
+ #endif
+ 
+ 	b		common_start
+@@ -766,7 +784,7 @@ common_start:
+ 
+ #if defined(DODGE)
+ 	/* Stage 2: common_start entered. */
+-	DODGE_BAND 2
++	DODGE_BAND 2, DODGE_C2
+ #endif
+ 
+ #if HAS_NEX_PG
+@@ -783,7 +801,7 @@ common_start:
+ 
+ #if defined(DODGE)
+ 	/* Stage 3: TCR_EL1 programmed (sysreg_restore was readable). */
+-	DODGE_BAND 3
++	DODGE_BAND 3, DODGE_C3
+ #endif
+ 
+ 	/* Set up translation table base registers.
+@@ -802,7 +820,7 @@ common_start:
+ 
+ #if defined(DODGE)
+ 	/* Stage 4: TTBR0 (V=P root) programmed; set_mmu_ttb returned. */
+-	DODGE_BAND 4
++	DODGE_BAND 4, DODGE_C4
+ #endif
+ 
+ 	add		x0, x25, PGBYTES
+@@ -834,7 +852,7 @@ common_start:
+ 
+ #if defined(DODGE)
+ 	/* Stage 5: MAIR_EL1 programmed and the TLB invalidated. */
+-	DODGE_BAND 5
++	DODGE_BAND 5, DODGE_C5
+ #endif
+ 
+ 
+@@ -904,7 +922,7 @@ common_start:
+ 	isb
+ 
+ 	/* Stage 6: about to enable the MMU (TTBRs/TCR/MAIR already programmed). */
+-	DODGE_BAND 6
++	DODGE_BAND 6, DODGE_C6
+ #endif
+ 
+ 	// Enable caches, MMU, ROP and JOP
+@@ -932,10 +950,10 @@ common_start:
+ 	bic		x4, x0, #SCTLR_M_ENABLED
+ 	msr		SCTLR_EL1, x4
+ 	isb		sy
+-	DODGE_BAND 7
++	DODGE_BAND 7, DODGE_C7
+ 	msr		SCTLR_EL1, x3
+ 	isb		sy
+-	DODGE_BAND 8
++	DODGE_BAND 8, DODGE_C8
+ 	mov		x0, x3
+ #endif
+ 
