@@ -17,8 +17,23 @@ import adt  # noqa: E402
 # (size 0x16ac3000, ends 0xd4e23000) is carve-out free, and it is inside the
 # shim's low-8GB identity map. sweet's 0xb0000000/0x4d000000 is NOT usable here
 # (it spans xbl_ramdump, gunyah_hyp_region1, tz_merged, oem_vm and the splash fb).
-PHYS_BASE = 0xbe360000
-MEM_SIZE = 0x16000000
+#
+# PHYS_BASE must also be congruent to the kernel's virtual base modulo the L2
+# block size (32MB with 16K pages), and the simplest way is to make it
+# 32MB-aligned, since the virtual base already is. start.s builds the bootstrap
+# KVA map out of L2 blocks and create_l2_block_entries masks the physical
+# address with ARM_TTE_BLOCK_L2_MASK (bits 47:25), so a block always maps
+# block-base to block-base. With the old 0xbe360000 the virtual base had offset
+# 0 inside its block and the physical base had offset 0x360000, so the KVA of
+# the kernel resolved 0x360000 BELOW where the kernel actually sits, and xnu
+# landed in garbage as soon as it branched to its own address space. The V=P
+# map never showed this, because there VA and PA are trivially congruent.
+#
+# 0xc0000000..0xd4000000 is inside the same carve-out-free bank as before.
+# Alignment found by KSN2redawew/ios-giuliac (commit 6dd49748), which hit it
+# first on an Ace 5.
+PHYS_BASE = 0xc0000000
+MEM_SIZE = 0x14000000
 # --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.

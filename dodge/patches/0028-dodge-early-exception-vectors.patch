@@ -1,0 +1,278 @@
+From 621698e7120b1d43dd8eeab2ca0d25294b4629c0 Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 00:55:05 +0500
+Subject: [PATCH] dodge: early exception vectors that paint the fault on the
+ panel
+
+Idea from KSN2redawew/ios-giuliac (commits cafe6c62, cf36dc35), which
+renders crash reasons on screen by patching the built kernel. This is the
+same capability in source.
+
+Between common_start programming VBAR_EL1 and arm_vm_init tearing down
+the bootstrap TTBR0 we are completely blind. xnu's vectors are a kernel
+virtual address, so a fault taken before TTBR1 translates faults again on
+the vector fetch and the core simply stops - every failure in that window
+looks identical, and looks like a hang. That is the whole reason the last
+several rounds have been counting stripes.
+
+Install dodge_early_vectors over VBAR_EL1 for exactly that window. They
+sit in the identity-mapped kernel image, so they can actually run, and
+they print the exception class, ESR, FAR and ELR on a blue screen through
+the existing early console. Each entry switches to its own stack, since
+the interrupted SP is a KVA that TTBR1 cannot translate yet; the
+exception has already selected SP_EL1, so SP_EL0 is untouched.
+dodge_early_disable() hands VBAR_EL1 back to xnu before the mapping these
+vectors live in goes away.
+
+The console background is a variable now, so the exception screen reads
+as blue rather than blue with black bands behind the text.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/dodge_early.c | 95 +++++++++++++++++++++++++++++++++++++--
+ osfmk/arm64/dodge_early.h |  2 +
+ osfmk/arm64/start.s       | 69 ++++++++++++++++++++++++++++
+ 3 files changed, 162 insertions(+), 4 deletions(-)
+
+diff --git a/osfmk/arm64/dodge_early.c b/osfmk/arm64/dodge_early.c
+index d31253d..9ae9114 100644
+--- a/osfmk/arm64/dodge_early.c
++++ b/osfmk/arm64/dodge_early.c
+@@ -1,6 +1,6 @@
+ /*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
+- * per-CPU state: panic() can reach this before a current thread exists.
++ * OnePlus 13 bootstrap console. No allocation, locks, ADT parsing or per-CPU
++ * state: panic() can reach this before a current thread exists.
+  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+  * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
+  */
+@@ -25,6 +25,16 @@ extern unsigned char iso_font[256 * 16];
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
++/* Background behind the text; turned blue when an exception is rendered. */
++static uint32_t early_bg = 0xff000000u;
++
++/*
++ * Stack for dodge_early_vectors, which cannot use the one it interrupted: at
++ * the point these vectors are installed SP holds a kernel virtual address that
++ * TTBR1 cannot translate yet. start.s hardcodes this size, keep them in step.
++ */
++#define DODGE_EARLY_EXC_STACK_SIZE 4096
++uint8_t dodge_early_exc_stack[DODGE_EARLY_EXC_STACK_SIZE] __attribute__((aligned(16)));
+ 
+ static void
+ dodge_early_clear_row(void)
+@@ -32,7 +42,7 @@ dodge_early_clear_row(void)
+ 	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+ 		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
+ 		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
++			line[x] = early_bg;
+ 		}
+ 	}
+ }
+@@ -66,7 +76,7 @@ dodge_early_putc(char c)
+ 			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+ 			    early_col * EARLY_CELL_W;
+ 			for (unsigned int gx = 0; gx < 8; gx++) {
+-				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
++				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : early_bg;
+ 				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+ 					line[gx * EARLY_SCALE + sx] = pixel;
+ 				}
+@@ -120,11 +130,88 @@ dodge_early_panic(const char *fmt, va_list *args)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++static void
++dodge_early_hex(const char *label, uint64_t v)
++{
++	dodge_early_string(label);
++	for (int shift = 60; shift >= 0; shift -= 4) {
++		unsigned int digit = (unsigned int)((v >> shift) & 0xf);
++		dodge_early_putc((char)(digit < 10 ? '0' + digit : 'A' + digit - 10));
++	}
++	dodge_early_putc('\n');
++}
++
++/* The exception classes worth naming this early; the rest print as a number. */
++static const char *
++dodge_early_ec(uint64_t esr)
++{
++	switch ((esr >> 26) & 0x3f) {
++	case 0x15: return "svc";
++	case 0x20: return "instruction abort, lower EL";
++	case 0x21: return "instruction abort";
++	case 0x22: return "pc alignment";
++	case 0x24: return "data abort, lower EL";
++	case 0x25: return "data abort";
++	case 0x26: return "sp alignment";
++	case 0x2f: return "serror";
++	case 0x30: case 0x31: return "breakpoint";
++	case 0x3c: return "brk";
++	default: return "see ec in esr";
++	}
++}
++
++/*
++ * Render a fault on the panel. Reached only from dodge_early_vectors, which
++ * start.s installs over VBAR_EL1 for the window between programming the
++ * exception vectors and arm_vm_init tearing down the bootstrap TTBR0.
++ *
++ * Without this the window is completely blind: xnu's own vectors are a kernel
++ * virtual address, so a fault taken before TTBR1 works faults again on the
++ * vector fetch and the core simply stops, which is indistinguishable from a
++ * hang. Idea taken from KSN2redawew/ios-giuliac, which renders crash reasons
++ * on screen by patching the built kernel; this is the same thing in source.
++ */
++void
++dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far, uint64_t elr)
++{
++	/* A fault outranks whatever turned the console off, but never recurse. */
++	if (early_panicking) {
++		return;
++	}
++	early_panicking = 1;
++	early_disabled = 0;
++	early_bg = 0xff0000ffu;
++	for (unsigned int y = 0; y < EARLY_HEIGHT; y++) {
++		volatile uint32_t *line = EARLY_FB + y * EARLY_STRIDE;
++		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++			line[x] = early_bg;
++		}
++	}
++	early_started = 1;
++	early_row = 0;
++	early_col = 0;
++	dodge_early_string("DODGE EXCEPTION: ");
++	dodge_early_string(dodge_early_ec(esr));
++	dodge_early_putc('\n');
++	dodge_early_hex("slot ", slot);
++	dodge_early_hex("esr  ", esr);
++	dodge_early_hex("far  ", far);
++	dodge_early_hex("elr  ", elr);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ void
+ dodge_early_disable(void)
+ {
+ 	dodge_early_mark(8, "leaving bootstrap TTBR0");
+ 	early_disabled = 1;
++	/*
++	 * Hand the vectors back to xnu before the mapping these ones live in
++	 * goes away. From here a fault is xnu's to report.
++	 */
++	extern void ExceptionVectorsBase;
++	__asm__ volatile ("msr VBAR_EL1, %0\n\tisb"
++	    :: "r" ((uintptr_t)&ExceptionVectorsBase) : "memory");
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ #endif /* DODGE */
+diff --git a/osfmk/arm64/dodge_early.h b/osfmk/arm64/dodge_early.h
+index 478a472..61479ee 100644
+--- a/osfmk/arm64/dodge_early.h
++++ b/osfmk/arm64/dodge_early.h
+@@ -4,11 +4,13 @@
+ 
+ #include <pexpert/arm64/board_config.h>
+ #include <stdarg.h>
++#include <stdint.h>
+ 
+ #if defined(DODGE)
+ void dodge_early_mark(unsigned int stage, const char *label);
+ void dodge_early_putc(char c);
+ void dodge_early_panic(const char *fmt, va_list *args);
++void dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far, uint64_t elr);
+ void dodge_early_disable(void);
+ #else
+ static inline void dodge_early_mark(unsigned int stage, const char *label)
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 7dbfc0a..dede4b3 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -125,6 +125,65 @@
+ 	b.ne	8b
+ 	dsb		sy
+ .endmacro
++
++/*
++ * dodge_early_vectors
++ *
++ * Exception vectors for the window between programming VBAR_EL1 in
++ * common_start and arm_vm_init tearing down the bootstrap TTBR0. xnu's own
++ * vectors sit at a kernel virtual address, so a fault taken before TTBR1
++ * translates faults again on the vector fetch itself and the core just stops:
++ * every failure in that window looks identical, and like a hang. These live in
++ * the identity-mapped kernel image instead, so they can actually run and paint
++ * ESR/FAR/ELR on the panel. dodge_early_disable() hands VBAR_EL1 back to xnu.
++ *
++ * Reported on-screen crash reasons are an idea from KSN2redawew/ios-giuliac,
++ * which does it by patching the built kernel; this is the same thing in source.
++ *
++ * The interrupted SP is a kernel virtual address that TTBR1 cannot translate
++ * yet, so each entry switches to dodge_early_exc_stack (4096 bytes, declared
++ * in dodge_early.c - keep the size in step). Taking the exception has already
++ * selected SP_EL1, so the interrupted SP_EL0 is left alone.
++ */
++.macro DODGE_EXC_ENTRY
++	.balign	0x80
++	mov		w0, #$0
++	b		Ldodge_exc_common
++.endmacro
++
++	.balign	0x800
++	.globl	EXT(dodge_early_vectors)
++LEXT(dodge_early_vectors)
++	DODGE_EXC_ENTRY 0			// EL1t: synchronous, irq, fiq, serror
++	DODGE_EXC_ENTRY 1
++	DODGE_EXC_ENTRY 2
++	DODGE_EXC_ENTRY 3
++	DODGE_EXC_ENTRY 4			// EL1h
++	DODGE_EXC_ENTRY 5
++	DODGE_EXC_ENTRY 6
++	DODGE_EXC_ENTRY 7
++	DODGE_EXC_ENTRY 8			// lower EL, AArch64
++	DODGE_EXC_ENTRY 9
++	DODGE_EXC_ENTRY 10
++	DODGE_EXC_ENTRY 11
++	DODGE_EXC_ENTRY 12			// lower EL, AArch32
++	DODGE_EXC_ENTRY 13
++	DODGE_EXC_ENTRY 14
++	DODGE_EXC_ENTRY 15
++
++Ldodge_exc_common:
++	mrs		x1, ESR_EL1
++	mrs		x2, FAR_EL1
++	mrs		x3, ELR_EL1
++	adrp	x4, EXT(dodge_early_exc_stack)@page
++	add		x4, x4, EXT(dodge_early_exc_stack)@pageoff
++	add		x4, x4, #4096
++	mov		sp, x4
++	bl		EXT(dodge_early_exception)
++	/* Nothing to return to: leave the screen up for a photograph. */
++1:
++	wfe
++	b		1b
+ #endif /* DODGE */
+ 
+ /*
+@@ -834,6 +893,16 @@ common_start:
+ #endif /* HAS_APPLE_PAC */
+ 
+ #if defined(DODGE)
++	/*
++	 * Take the vectors over until arm_vm_init hands them back. The KVA just
++	 * programmed cannot be fetched from until TTBR1 works, so until then a
++	 * fault would only fault again; ours are identity-mapped and can report.
++	 */
++	adrp	x0, EXT(dodge_early_vectors)@page
++	add		x0, x0, EXT(dodge_early_vectors)@pageoff
++	msr		VBAR_EL1, x0
++	isb
++
+ 	/* Stage 6: about to enable the MMU (TTBRs/TCR/MAIR already programmed). */
+ 	DODGE_BAND 6
+ #endif
