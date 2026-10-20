@@ -1,0 +1,122 @@
+From 7733a979b98a7594741f04128f4da79f6f55684b Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 01:32:33 +0500
+Subject: [PATCH] dodge: report LR in the exception screen, and keep the shim's
+ text
+
+Both from KSN2redawew/ios-giuliac commit 227b31c4.
+
+ELR says where the fault happened; lr says who called the code it
+happened in, which is the difference between knowing the instruction and
+knowing the path. It is captured in the vector stub before the bl into C
+clobbers it, and the branch from each vector slot is a plain b, so it
+still holds what the faulting context had.
+
+The handler also no longer paints over the top of the panel. The shim's
+handover text lives there - the CPU facts, the load addresses, the VERIFY
+line - and that is context for the fault, so clearing it threw away more
+than the blue background was worth. The fill and the text now start below
+it.
+
+Checked and NOT needed from the same batch:
+  - ccf6182c NOPs the ml_phys latency watchdog panics. phy_read_panic is
+    indeed 1 in a DEVELOPMENT build like ours, but the panic sits inside
+    'if (report_phy_read_delay != 0)' and that tunable defaults to 0, so
+    the whole timing path is skipped. We set no boot-arg that arms it.
+  - 8d12dfbd bypasses the arm_vm_init segment contiguity asserts. Checked
+    against our own payload: __DATA_CONST starts exactly at the end of
+    __TEXT and __TEXT_EXEC exactly at the end of __DATA_CONST, so both
+    asserts hold.
+  - 1d63f7e4 and 154c9d53 are their own tracer layout and link addresses.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/dodge_early.c | 16 +++++++++++++---
+ osfmk/arm64/dodge_early.h |  3 ++-
+ osfmk/arm64/start.s       | 11 +++++++----
+ 3 files changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/osfmk/arm64/dodge_early.c b/osfmk/arm64/dodge_early.c
+index 9ae9114..767ee5b 100644
+--- a/osfmk/arm64/dodge_early.c
++++ b/osfmk/arm64/dodge_early.c
+@@ -171,8 +171,17 @@ dodge_early_ec(uint64_t esr)
+  * hang. Idea taken from KSN2redawew/ios-giuliac, which renders crash reasons
+  * on screen by patching the built kernel; this is the same thing in source.
+  */
++/*
++ * Text rows left untouched at the top of the panel. The shim's handover text
++ * lives there - the CPU facts, the load addresses and the VERIFY line - and
++ * that is context for the fault, so painting over it loses more than it gains.
++ * Keeping it is an idea from KSN2redawew/ios-giuliac (commit 227b31c4).
++ */
++#define EARLY_EXC_TOP_ROW 25u
++
+ void
+-dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far, uint64_t elr)
++dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far,
++    uint64_t elr, uint64_t lr)
+ {
+ 	/* A fault outranks whatever turned the console off, but never recurse. */
+ 	if (early_panicking) {
+@@ -181,14 +190,14 @@ dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far, uint64_t el
+ 	early_panicking = 1;
+ 	early_disabled = 0;
+ 	early_bg = 0xff0000ffu;
+-	for (unsigned int y = 0; y < EARLY_HEIGHT; y++) {
++	for (unsigned int y = EARLY_EXC_TOP_ROW * EARLY_CELL_H; y < EARLY_HEIGHT; y++) {
+ 		volatile uint32_t *line = EARLY_FB + y * EARLY_STRIDE;
+ 		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+ 			line[x] = early_bg;
+ 		}
+ 	}
+ 	early_started = 1;
+-	early_row = 0;
++	early_row = EARLY_EXC_TOP_ROW;
+ 	early_col = 0;
+ 	dodge_early_string("DODGE EXCEPTION: ");
+ 	dodge_early_string(dodge_early_ec(esr));
+@@ -197,6 +206,7 @@ dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far, uint64_t el
+ 	dodge_early_hex("esr  ", esr);
+ 	dodge_early_hex("far  ", far);
+ 	dodge_early_hex("elr  ", elr);
++	dodge_early_hex("lr   ", lr);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+diff --git a/osfmk/arm64/dodge_early.h b/osfmk/arm64/dodge_early.h
+index 61479ee..2e5b0a4 100644
+--- a/osfmk/arm64/dodge_early.h
++++ b/osfmk/arm64/dodge_early.h
+@@ -10,7 +10,8 @@
+ void dodge_early_mark(unsigned int stage, const char *label);
+ void dodge_early_putc(char c);
+ void dodge_early_panic(const char *fmt, va_list *args);
+-void dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far, uint64_t elr);
++void dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far,
++    uint64_t elr, uint64_t lr);
+ void dodge_early_disable(void);
+ #else
+ static inline void dodge_early_mark(unsigned int stage, const char *label)
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f1f06c1..3b50309 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -193,10 +193,13 @@ Ldodge_exc_common:
+ 	mrs		x1, ESR_EL1
+ 	mrs		x2, FAR_EL1
+ 	mrs		x3, ELR_EL1
+-	adrp	x4, EXT(dodge_early_exc_stack)@page
+-	add		x4, x4, EXT(dodge_early_exc_stack)@pageoff
+-	add		x4, x4, #4096
+-	mov		sp, x4
++	/* Captured before the bl below clobbers it: ELR says where the fault
++	 * happened, lr says who called the code it happened in. */
++	mov		x4, lr
++	adrp	x5, EXT(dodge_early_exc_stack)@page
++	add		x5, x5, EXT(dodge_early_exc_stack)@pageoff
++	add		x5, x5, #4096
++	mov		sp, x5
+ 	bl		EXT(dodge_early_exception)
+ 	/* Nothing to return to: leave the screen up for a photograph. */
+ 1:
