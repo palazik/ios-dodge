@@ -1,0 +1,58 @@
+From bc1df029921619593a05706339b0ef1ff5a9620d Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 00:58:35 +0500
+Subject: [PATCH] dodge: local TLB flush when leaving the bootstrap tables
+
+Found by KSN2redawew/ios-giuliac (commit 5b5b104c), which patches the
+two instructions in the built kernel.
+
+arm_vm_init switches TTBR0 to invalid_ttep and then calls
+flush_mmu_tlb(), which is "tlbi vmalle1is; dsb ish": a broadcast
+invalidate that waits for every core in the inner shareable domain to
+complete it. With the seven secondaries dormant in the DSU that can
+never complete, and the result is a silent hang with no fault to report -
+the one failure mode patch 0028's exception vectors cannot catch, since
+nothing is actually faulting.
+
+Nothing else is running at this point, xnu has not started the
+secondaries yet, so a local invalidate is sufficient. xnu already has
+exactly that pair as flush_core_tlb(), so this needs no new code.
+
+Our own shim makes this more likely, not less: the granule probe now
+starts all seven secondaries and powers them back off, so they are
+dormant by the time xnu gets here.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/arm_vm_init.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 32499bd..827bcd8 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2162,7 +2162,24 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	dodge_early_disable();
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
++#if defined(ARM64_BOARD_CONFIG_DODGE)
++	/*
++	 * Local flush, not the broadcast one. flush_mmu_tlb() is
++	 * "tlbi vmalle1is; dsb ish", which asks every core in the inner
++	 * shareable domain to complete the invalidate; with the seven
++	 * secondaries dormant in the DSU that can simply never complete, and
++	 * the result is a silent hang here with no fault to report. Nothing
++	 * else is running yet - xnu has not started the secondaries - so the
++	 * local invalidate is all this needs.
++	 *
++	 * Found by KSN2redawew/ios-giuliac (commit 5b5b104c), which patches
++	 * these two instructions in the built kernel; flush_core_tlb() is the
++	 * same pair, and xnu already provides it.
++	 */
++	flush_core_tlb();
++#else
+ 	flush_mmu_tlb();
++#endif
+ 	kva_active = TRUE;
+ 	// global table pointers may need to be different due to physical aperture remapping
+ 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
