@@ -174,6 +174,18 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
+	/*
+	 * Hand over with the virtual timer disarmed and all interrupts masked.
+	 * CNTV is a LEVEL interrupt: if ABL, or anything we did here, leaves it
+	 * armed with its PPI pending, it storms the instant the kernel first
+	 * unmasks DAIF - long before a timer driver exists to acknowledge it -
+	 * and the symptom is a dead phone with no output, not an error.
+	 *
+	 * Found by blahajcoding/ios-lemonadep (commit 971286ce) on a OnePlus 9
+	 * Pro, where the shim's own GIC test was what left it armed.
+	 */
+	__asm__ volatile("msr cntv_ctl_el0, xzr; msr daifset, #0xf; isb" ::: "memory");
+
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);

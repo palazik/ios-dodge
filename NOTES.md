@@ -179,3 +179,32 @@ Two ways out:
     become 25 (39-bit), and the kernel links at 0xfffffe0006000000 which only
     exists in a 47-bit TTBR1 region, so VM_KERNEL_LINK_ADDRESS, the ADT and
     mkpayload.py's PAGE constant all move together.
+
+## What reaching PID 1 took on another Snapdragon (lemonadep, SM8350)
+
+blahajcoding/ios-lemonadep has this port running to PID 1 on a OnePlus 9 Pro,
+on a RAM disk root. Their notes name exactly two defects that stood between a
+dead boot and launchd, and both are worth knowing here:
+
+1. `_enable_virtual_timer()` writes `CNTP_CTL_EL0` "as a precaution". Access to
+   the physical timer from EL1 is gated by `CNTHCTL_EL2`, and Qualcomm firmware
+   keeps it at EL2, so the precaution traps as an undefined instruction in the
+   middle of timer init. **Taken** (patch 0034).
+
+2. The early console's alias mapping has to carry the 32 MB block offset of the
+   framebuffer base. Their 0xE4D00000 sits 13 MiB into its block; sweet's
+   0x9C000000 is block aligned, which hid the bug entirely.
+
+The second one does not apply to us *yet*, and the reason is worth writing down
+because it will. Our early console writes the framebuffer at its identity
+address, and the bootstrap block we add in start.s now maps the containing
+block 0xfc000000, so hardware preserves the offset and 0xfc800000 resolves to
+itself. The moment we port dipa 0012 (keep the debug console after TTBR0 goes
+away) we gain exactly the alias they tripped over: our 0xfc800000 is 8 MiB into
+its block, so an alias VA built from the block base alone would land 8 MiB
+short of the scanout and print into nothing. Same arithmetic that produced our
+RES0 descriptor bug, one level up.
+
+Also worth noting for calibration: they are on a RAM disk root with UFS and SMP
+still ahead, and have taken no partition backups. We are ahead on both of those
+and behind on everything after the MMU, which is the granule.

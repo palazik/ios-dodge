@@ -1,0 +1,89 @@
+From 9c8168546fb00d4c4c5a72eb361925db8a874147 Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 10:39:43 +0500
+Subject: [PATCH] dodge: disarm the virtual timer, and stop touching the
+ physical one
+
+Both from blahajcoding/ios-lemonadep, which has this port running to PID
+1 on a OnePlus 9 Pro.
+
+CNTV is a level interrupt. If the kernel is entered with it armed and its
+PPI pending, it storms the instant DAIF is first opened - before any
+timer driver exists to acknowledge it - and the symptom is a dead phone
+with no output rather than an error. Their shim's own GIC test was what
+armed it; ours has GIC and timer tests too, and ABL's state at handover
+is not something we control either way. So the shim now disarms CNTV and
+masks DAIF immediately before entering xnu, and reset_vector does the
+same on every entry including a warm reset (their commit 971286ce).
+
+_enable_virtual_timer() also writes CNTP_CTL_EL0 "as a precaution".
+Access to the physical timer from EL1 is gated by CNTHCTL_EL2, and the
+firmware here keeps it at EL2, so that precaution traps as an undefined
+instruction in the middle of timer init. The virtual timer is the one we
+are given (their commit 77d12128).
+
+Not taken from the same fork: e8e3f61b clears SCTLR_EL1.DZE before
+entering xnu because ABL leaves it set. That cannot matter here -
+SCTLR_DZE_ENABLED is part of xnu's own SCTLR_EL1_DEFAULT, which
+common_start writes a moment later - and the stated mechanism does not
+hold either, since DZE gates DC ZVA at EL0 and has nothing to do with
+MSR DAIF. Their handover also keeps the MMU on, because their RAM is
+above 4 GiB; ours is at 0xc0000000 and hands over with it off.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/machine_routines.c | 12 ++++++++++++
+ osfmk/arm64/start.s            | 15 +++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index bdb6dc9..793d62e 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2258,8 +2258,20 @@ _enable_virtual_timer(void)
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+ 
+ 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
++#if !defined(ARM64_BOARD_CONFIG_DODGE)
+ 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
+ 	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
++#else
++	/*
++	 * The physical timer is not ours on this platform. Access to
++	 * CNTP_CTL_EL0 from EL1 is gated by CNTHCTL_EL2, and the firmware here
++	 * keeps the physical timer at EL2, so this "precaution" traps instead -
++	 * an undefined instruction in the middle of timer init. The virtual
++	 * timer, which the line above enables, is the one we are given.
++	 *
++	 * From blahajcoding/ios-lemonadep (commit 77d12128).
++	 */
++#endif
+ }
+ 
+ void
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 3b50309..4d1cc1c 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -249,6 +249,21 @@ LEXT(reset_vector)
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+ 
++#if defined(DODGE)
++	/*
++	 * Disarm the virtual timer before anything else. CNTV is a level
++	 * interrupt, so if we are entered with it armed and its PPI pending it
++	 * storms the moment DAIF is first opened, before any timer driver
++	 * exists - a silent dead phone rather than an error. The shim already
++	 * clears it at handover; this is the same guarantee on every entry to
++	 * the kernel, including a warm reset.
++	 *
++	 * From blahajcoding/ios-lemonadep (commit 971286ce).
++	 */
++	msr		CNTV_CTL_EL0, xzr
++	isb
++#endif
++
+ #if !(defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR))
+ 	// Set low reset vector before attempting any loads
+ 	adrp    x0, EXT(LowExceptionVectorBase)@page
