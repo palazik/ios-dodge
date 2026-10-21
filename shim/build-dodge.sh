@@ -3,16 +3,22 @@
 # Same shim as dipa's build.sh, but using the LLVM toolchain (no
 # aarch64-linux-gnu-gcc needed) and the OP13 dtb + framebuffer.
 #
-# Usage: build-dodge.sh PAYLOAD DTB [OUTDIR]
+# Usage: build-dodge.sh PAYLOAD [OUTDIR]
 #   PAYLOAD  a DODGEXNU payload from tools/mkpayload.py (kernel + ADT + boot-args)
-#   DTB      the OnePlus 13 device tree blob (e.g. sm8750.dtb) for mkbootimg
+#
+# No device tree is passed or bundled, unlike sweet's header-v2 flow. A header
+# v4 boot image carries no dtb at all, and the shim does not need one baked in:
+# ABL hands it the live FDT pointer in x0 (see start.S), which is the device's
+# own, always current, and cannot go stale against the phone. The dtb dumped
+# from /sys/firmware/fdt is still worth keeping on the PC - every address in
+# tools/mkadt.py was read out of it - but nothing in the build consumes it.
+#
 # RAM-boot the result with:  fastboot boot OUTDIR/dodge-boot.img   (writes nothing)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PAYLOAD="${1:?need a DODGEXNU payload (tools/mkpayload.py)}"
-DTB="${2:?need the OnePlus 13 dtb}"
-OUT="${3:-out-dodge}"
+OUT="${2:-out-dodge}"
 mkdir -p "$OUT"
 
 TARGET=aarch64-linux-gnu
@@ -37,7 +43,11 @@ truncate -s "$size" "$OUT/Image"
 # "no DODGEXNU payload" with a 21 MB initrd that was not ours).
 cat "$PAYLOAD" >> "$OUT/Image"
 # Tiny empty ramdisk — some bootloaders dislike a zero-size one.
-(cd "$OUT" && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
+# Fixed mtime and gzip -n so the image is byte-reproducible: cpio records the
+# directory's mtime and gzip would record its own, which made two builds of
+# identical inputs differ and defeated comparing SHA256SUMS across rebuilds.
+(cd "$OUT" && rm -rf rd && mkdir rd && touch -d @0 rd && cd rd && \
+	find . | cpio -o -H newc --quiet --reproducible | gzip -9n > ../ramdisk.bin)
 
 # header v4 — the OP13's native (Android 15 / GKI) format, confirmed booting on
 # device. v4 stores no load addresses and no dtb, so ABL uses its own known-good

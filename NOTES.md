@@ -146,3 +146,36 @@ dipa already built a QEMU harness (in `tools/`, study + adapt for dodge, don't c
 - GICv3: GICD 0x16000000 (0x10000), GICR 0x16080000 (0x200000), redistributor-stride
   0x40000, 1 region. Arch timer 19.2 MHz. CPUs: 8 Oryon / 2 clusters. 16K granule.
   Framebuffer bootloader-provided (ABL/Silicium), address via ADT/boot-args.
+
+## SM8750 (Snapdragon 8 Elite) does not implement the 16K translation granule
+
+Measured on the device, not inferred. The shim reads ID_AA64MMFR0_EL1 on the
+boot core and prints it before handover:
+
+    CPU    el=00000001  tg16=00000000
+    MMFR0  2100122100001024
+
+Decoded: PARange 44-bit, ASID 16-bit, TGran4 **supported**, TGran64
+**supported**, TGran16 **NOT supported** (and TGran16_2 not supported either).
+The convention is inverted between these fields: for TGran4/TGran64 a zero
+means supported, for TGran16 a zero means not implemented.
+
+xnu is built for 16K pages only. With TGran16 unimplemented, TCR_EL1.TG0/TG1
+hold a reserved value, so every translation faults the instant SCTLR_EL1.M is
+set. This is the hard wall at boot-progress stage 6: the kernel programs TCR,
+TTBR0, TTBR1 and MAIR correctly and dies on the MMU enable itself. No amount of
+fixing our own code gets past it on such a core.
+
+hackiosx.dev's compatibility page does not mention page-size support, because
+every chip tested so far implements 16K. For Snapdragon 8 Elite and anything
+else using Qualcomm's Oryon cores, it is the first thing to check, and it is
+one register read in the shim.
+
+Two ways out:
+  - boot xnu on a core that does implement 16K, if the prime cluster differs
+    from the performance cluster (being measured; a big.LITTLE SoC is
+    architecturally allowed to differ here);
+  - rebuild xnu for 4K pages. That is not only ARM_PGSHIFT: with 4K, T0SZ/T1SZ
+    become 25 (39-bit), and the kernel links at 0xfffffe0006000000 which only
+    exists in a 47-bit TTBR1 region, so VM_KERNEL_LINK_ADDRESS, the ADT and
+    mkpayload.py's PAGE constant all move together.
