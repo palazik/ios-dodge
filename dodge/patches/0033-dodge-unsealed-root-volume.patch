@@ -1,0 +1,42 @@
+From 655cfb6ba9eb36419dda4c112aa54cbe3451f075 Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 10:36:46 +0500
+Subject: [PATCH 33/33] dodge: continue with an unsealed root volume
+
+Port of dipa-studio/ios-sweet 0029 (credit: dipa-studio).
+
+bsd_init panics if the root volume fails FSIOC_KERNEL_ROOTAUTH. dodge has
+no chain of trust to extend - the kernel is booted unsigned, there is no
+Image4 and no real AMFI - and an HFS root is not a sealed volume, so the
+check can only ever fail. Report it and carry on.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ bsd/kern/bsd_init.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 53659cf..0bd87ab 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -927,9 +927,20 @@ bsd_init(void)
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
++#if defined(ARM64_BOARD_CONFIG_DODGE)
++			/*
++			 * dodge has no chain of trust to extend: the kernel itself is
++			 * booted unsigned and there is no Image4/AMFI, and its HFS root
++			 * cannot be a sealed volume. Report it instead of panicking.
++			 */
++			if (autherr) {
++				printf("DODGE: root volume is not authenticated (error %d); continuing unsealed\n", autherr);
++			}
++#else
+ 			if (autherr) {
+ 				panic("rootvp not authenticated after mounting");
+ 			}
++#endif
+ 		}
+ 	}
+ 
