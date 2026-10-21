@@ -1,0 +1,73 @@
+From ac780e28cb0b22058a26b45ec4dd8b12d1bd2710 Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 12:04:51 +0500
+Subject: [PATCH] dodge: drop the MMU before reporting a fault
+
+The 4K build cleared the granule wall: boot-progress stage 7 now draws,
+which is the stripe painted after the MMU was enabled and switched off
+again, so the core survives SCTLR_EL1.M. Stage 8 - the same store with
+the MMU left on, through the bootstrap V=P tables - does not.
+
+That should have produced a fault report and instead produced silence,
+and the reason is a hole in patch 0028: the exception handler reports by
+writing the framebuffer, so when the thing that faulted IS the
+framebuffer mapping, drawing the report faults again. The recursion is a
+hang, which is indistinguishable from the fault never happening - the
+exact failure mode those vectors exist to abolish.
+
+So the handler now clears SCTLR_EL1.M on entry. With translation off the
+framebuffer is reachable physically, the way every stripe before stage 8
+reached it. This is safe only because these vectors cover the window
+where the kernel runs identity-mapped, so the PC and the handler's own
+stack are at their physical addresses either way; dodge_early_disable()
+hands VBAR_EL1 back to xnu before that stops holding.
+
+The descriptor itself checks out in the built kernel - base 0xfc800000
+masked to the 2MB block, index 484, written at bootstrap_pagetables +
+0x2000, which is the V=P L2 page at 4K. So the next thing to learn is
+what ESR and FAR say, not what I can infer from the disassembly.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/start.s | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 22cb7f0..430316f 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -196,10 +196,30 @@ Ldodge_exc_common:
+ 	/* Captured before the bl below clobbers it: ELR says where the fault
+ 	 * happened, lr says who called the code it happened in. */
+ 	mov		x4, lr
+-	adrp	x5, EXT(dodge_early_exc_stack)@page
+-	add		x5, x5, EXT(dodge_early_exc_stack)@pageoff
+-	add		x5, x5, #4096
+-	mov		sp, x5
++
++	/*
++	 * Switch the MMU off before reporting.
++	 *
++	 * The console writes the framebuffer, so if the fault WAS a bad
++	 * framebuffer mapping - which is one of the things worth reporting -
++	 * drawing the report faults again, and the recursion is a silent hang
++	 * instead of an error message. With translation off the framebuffer is
++	 * reachable physically, the way every stripe up to this point reached
++	 * it.
++	 *
++	 * Safe here because these vectors only cover the window where the
++	 * kernel runs identity-mapped: the PC and this handler's stack are at
++	 * their physical addresses either way. dodge_early_disable() hands
++	 * VBAR_EL1 back to xnu before that stops being true.
++	 */
++	mrs		x5, SCTLR_EL1
++	bic		x5, x5, #1			// SCTLR_EL1.M
++	msr		SCTLR_EL1, x5
++	isb		sy
++	adrp	x6, EXT(dodge_early_exc_stack)@page
++	add		x6, x6, EXT(dodge_early_exc_stack)@pageoff
++	add		x6, x6, #4096
++	mov		sp, x6
+ 	bl		EXT(dodge_early_exception)
+ 	/* Nothing to return to: leave the screen up for a photograph. */
+ 1:
