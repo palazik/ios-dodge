@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "mmu.h"
+#include "fdt.h"
 #include "loader.h"
 #include "ufs.h"
 
@@ -196,6 +197,80 @@ void secondary_main(uint64_t idx)
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_CPU_OFF, 0, 0, 0);
+}
+
+/*
+ * Where could xnu actually live?
+ *
+ * RAM banks from /memory minus every /reserved-memory carve-out, printed in
+ * MiB so a whole window fits on one line. PHYS_BASE in tools/mkadt.py was
+ * chosen by reading a dtb dumped from the phone weeks earlier, and that got it
+ * wrong twice: once over a carve-out, and once at an address not congruent to
+ * the kernel's virtual base modulo the 32MB L2 block. This prints the answer
+ * from the device, so the next such choice is checked rather than argued.
+ *
+ * Idea from blahajcoding/ios-lemonadep (commit 982b2f02), whose shim reports
+ * free windows "so XNU placement can be chosen from device output".
+ */
+#define MEM_MIN_WINDOW (256ull << 20)
+
+static struct fdt_range mem_bank[8];
+static struct fdt_range mem_resv[96];
+
+static void report_memory(uintptr_t dtb)
+{
+	int dyn = 0;
+	int nb = fdt_ram_banks(dtb, mem_bank, 8);
+	int nr = fdt_reserved(dtb, mem_resv, 96, &dyn);
+
+	stage = "memmap";
+	con_hex2("MEM", "banks=", (uint32_t)nb, "carveouts=", (uint32_t)nr);
+	if (dyn) {
+		con_hex2("MEM", "dynamic=", (uint32_t)dyn, 0, 0);
+	}
+	if (nb > 8) {
+		nb = 8;
+	}
+	if (nr > 96) {
+		nr = 96;
+	}
+	/* Sort the carve-outs by base so one sweep per bank finds the gaps. */
+	for (int i = 1; i < nr; i++) {
+		struct fdt_range k = mem_resv[i];
+		int j = i - 1;
+		while (j >= 0 && mem_resv[j].base > k.base) {
+			mem_resv[j + 1] = mem_resv[j];
+			j--;
+		}
+		mem_resv[j + 1] = k;
+	}
+
+	for (int b = 0; b < nb; b++) {
+		uint64_t cur = mem_bank[b].base;
+		uint64_t end = cur + mem_bank[b].size;
+
+		con_hex2("BANK", "baseMB=", (uint32_t)(cur >> 20),
+		    "sizeMB=", (uint32_t)(mem_bank[b].size >> 20));
+		for (int i = 0; i < nr && cur < end; i++) {
+			uint64_t rb = mem_resv[i].base;
+			uint64_t re = rb + mem_resv[i].size;
+
+			if (re <= cur || rb >= end) {
+				continue;	/* outside this bank */
+			}
+			if (rb > cur && rb - cur >= MEM_MIN_WINDOW) {
+				con_hex2("FREE", "baseMB=", (uint32_t)(cur >> 20),
+				    "sizeMB=", (uint32_t)((rb - cur) >> 20));
+			}
+			if (re > cur) {
+				cur = re;
+			}
+		}
+		if (cur < end && end - cur >= MEM_MIN_WINDOW) {
+			con_hex2("FREE", "baseMB=", (uint32_t)(cur >> 20),
+			    "sizeMB=", (uint32_t)((end - cur) >> 20));
+		}
+	}
 }
 
 /*
@@ -462,6 +537,7 @@ void shim_main(uint64_t dtb)
 		__asm__ volatile ("mrs %0, HCR_EL2" : "=r" (hcr));
 		con_hex("HCR_EL2", hcr);
 	}
+	report_memory(dtb);
 	probe_granule();
 	con_skip();
 	const char *why = loader_boot(dtb);
