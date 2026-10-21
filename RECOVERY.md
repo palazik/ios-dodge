@@ -36,8 +36,19 @@ adb exec-out "su -c 'dd if=/dev/block/sda bs=512 skip=$((S-2048)) count=2048'" >
 # human-readable map (if available)
 adb shell "su -c 'sgdisk -p /dev/block/sda'" > lun0-sgdisk.txt 2>/dev/null || true
 ```
-(The friend pack ships `gpt-backup.sh` that does exactly this.) Also back up any
-partition you cannot re-download (persist, modemst, frp, etc.).
+(The friend pack ships `gpt-backup.sh`, which does this and more.)
+
+## Back up what cannot be downloaded again
+`persist`, `modemst1`, `modemst2`, `fsg` and `fsc` hold calibration and radio
+data that is unique to the individual handset. It is in no firmware package and
+cannot be re-downloaded; losing it costs IMEI, sensor calibration and working
+mobile data, permanently. `boot`, `dtbo` and `vbmeta` are re-flashable from
+stock firmware but are worth having to hand.
+
+`tools/gpt-backup.sh` saves all of these alongside the GPT, resolving the A/B
+suffix automatically, and warns if a unique one could not be read. Keep the
+output directory off the phone. (This list is the one hackiosx.dev recommends
+for any Snapdragon port.)
 
 ## If the GPT/partitions are lost
 - Restore from your dump, from the SAME recovery: `dd` the head dump back to

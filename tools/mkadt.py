@@ -146,22 +146,32 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # DODGE SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
+    # DODGE SMP: all eight cores in physical-core order. The OnePlus 13 is not
+    # sweet's layout: every core is Oryon, six "performance" ones in cluster 0
+    # and two "prime" ones in cluster 1, and the MPIDRs are NOT core << 8.
+    # Taken from the live device tree (cpu@0..cpu@500, cpu@10000, cpu@10100);
+    # core << 8 would name 0x600 and 0x700, which this SoC does not have, so
+    # xnu would ask PSCI to start two cores that do not exist. The same
+    # mistake was in the shim's SMP sweep and hid the prime cores completely.
+    # The kernel defaults to one core and uses cpus=N to select a prefix.
     # QEMU retains its original single-CPU tree: its MPIDRs differ from dodge.
+    CPU_MPIDR = [0x00000, 0x00100, 0x00200, 0x00300,
+                 0x00400, 0x00500, 0x10000, 0x10100]
     cpu_nodes = []
     for core in range(1 if qemu else 8):
+        cluster = 0 if core < 6 else 1
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,oryon') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            # Real MPIDR (Aff2:Aff1:Aff0), what PSCI CPU_ON is given, NOT a
+            # logical ID. QEMU's single core is 0 either way.
+            ('reg', u32(0 if qemu else CPU_MPIDR[core])),
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
+            ('cluster-id', u32(cluster)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
-            ('cluster-core-id', u32(core)),
+            ('cluster-core-id', u32(core if cluster == 0 else core - 6)),
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
