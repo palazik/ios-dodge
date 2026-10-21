@@ -32,6 +32,7 @@ int main(int argc, char **argv)
 	const unsigned long long MINW = 256ull << 20;
 	for (int b = 0; b < nb && b < 8; b++) {
 		unsigned long long cur = bank[b].base, end = cur + bank[b].size;
+		if (bank[b].size < MINW) continue;
 		for (int i = 0; i < nr && cur < end; i++) {
 			unsigned long long rb = resv[i].base, re = rb + resv[i].size;
 			if (re <= cur || rb >= end) continue;

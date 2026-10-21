@@ -249,6 +249,14 @@ static void report_memory(uintptr_t dtb)
 		uint64_t cur = mem_bank[b].base;
 		uint64_t end = cur + mem_bank[b].size;
 
+		/*
+		 * Only banks big enough to hold a kernel. This phone reports 16,
+		 * and most are a few hundred KiB between carve-outs; printing all
+		 * of them scrolls the line we actually came here for off screen.
+		 */
+		if (mem_bank[b].size < MEM_MIN_WINDOW) {
+			continue;
+		}
 		con_hex2("BANK", "baseMB=", (uint32_t)(cur >> 20),
 		    "sizeMB=", (uint32_t)(mem_bank[b].size >> 20));
 		for (int i = 0; i < nr && cur < end; i++) {
