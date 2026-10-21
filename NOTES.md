@@ -1,3 +1,49 @@
+# START HERE (handoff, 2026-10-21)
+
+Keep this block at the top and current. Distinguish what was observed from
+what was inferred; this project has already lost time to confident guesses.
+
+**Goal.** iOS 16 (xnu-8796.141.3) on a OnePlus 13 (dodge, SM8750, Oryon).
+Built from source, patches 0001-0034, CI green.
+
+**Blocker: the boot core does not implement the 16K translation granule.**
+Measured on device, not inferred: ID_AA64MMFR0_EL1 = 0x2100122100001024,
+TGran16 = 0, which for that field means "not implemented" while the adjacent
+TGran4/TGran64 use the opposite convention. xnu is 16K-only, so TCR_EL1.TG0/TG1
+hold a reserved value and every translation faults the instant SCTLR_EL1.M is
+set. Boot-progress stripes stop at stage 6 of 9, exactly there.
+
+For calibration: ios-sweet records the same check as a milestone and its
+SM7150 reads 0x101122 -> TGran16 = 1, supported. Every device this project has
+run on said yes. Oryon is the first that says no.
+
+**Next action: friend-pack v14** (`fastboot boot dodge-boot.img`) prints
+`PRIME tg16=...` from cpu6, the prime cluster, over one PSCI CPU_ON.
+  - tg16 = 1 or 2 -> boot xnu pinned to a prime core; the port continues.
+  - tg16 = 0      -> rebuild for 4K pages. Not just ARM_PGSHIFT: T0SZ/T1SZ
+    become 25 (39-bit), and the kernel links at 0xfffffe0006000000 which only
+    exists in a 47-bit TTBR1 region, so VM_KERNEL_LINK_ADDRESS, the ADT and
+    mkpayload.py's PAGE all move together.
+  - stops before `PRIME` -> PSCI CPU_ON is unusable here; stop pursuing it.
+
+**Verified on this device** (not assumed):
+  - EL1 at handover, MMU off, x0 = live FDT.
+  - Panel 1440x3168 at 0xfc800000; UFS host 0x1d84000, UFSHCI 4.0, reads OK.
+  - vtimer INTID 27: /arm,armv8-timer interrupts are PPI 13/14/11/10, so
+    virtual = 16+11. sweet's "Qualcomm means INTID 19" is its own dtb's
+    numbering, not a platform rule. Timebase 19.2 MHz from the same node.
+  - MPIDRs 0x0-0x500 (six performance) and 0x10000/0x10100 (two prime).
+    `core << 8` is sweet's layout and was wrong here in two separate files.
+  - Free RAM windows from the live FDT: 0xbe360000..0xd4e23000 (362 MiB) and
+    0xe3720000..0xf3800000 (256 MiB). PHYS_BASE 0xc0000000 + 0x14000000 sits
+    inside the first, 32MB-aligned, no carve-out overlap.
+  - OSLAR_EL1 does not trap here: stripe 0 is drawn after it.
+
+**Rules.** RAM-boot only (`fastboot boot`); nothing is ever flashed. The iOS
+kernel must not write to the disk. LUN 0's GPT must stay untouched - the UFS
+driver is read-only in four independent places and refuses partitions outside
+the GPT's usable range. Never touch the iOS 18.6 IPSW.
+
 # iOS 16 (xnu-8796) on dodge (OnePlus 13, SM8750 / Oryon) — working notes
 
 Fork of dipa-studio/ios-sweet. We follow their PROVEN method (they reached the
