@@ -1,0 +1,155 @@
+From 47664a42eb2e1faed83b97a209927b573dc6fa8a Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 11:37:42 +0500
+Subject: [PATCH] dodge: build for 4K pages; Oryon has no 16K translation
+ granule
+
+Measured on the device, both core types, byte-identical registers:
+
+    CPU   el=00000001  tg16=00000000
+    PRIME tg16=00000000  mpidr=80010000
+    PRIME MMFR0 2100122100001024
+
+PSCI CPU_ON returned 0 and the prime core answered, so this is not a
+failure to ask - cpu6 is in the other cluster and reports exactly what
+the boot core reports. ID_AA64MMFR0_EL1.TGran16 = 0 means 16K is NOT
+implemented, while the neighbouring TGran4/TGran64 use the opposite
+convention and say 4K and 64K are. TGran16_2 agrees, and Android runs
+this SoC on 4K. No core here can do what xnu is built for, so
+__ARM_16K_PG__ goes, and with it the wall at boot-progress stage 6.
+
+__ARM64_PMAP_SUBPAGE_L1__ goes too, and that is not cosmetic. Together
+with 16K it selected T0SZ/T1SZ = 25: a 39-bit TTBR1 reaching down to
+0xffffff8000000000 while the kernel linked at 0xfffffe0007004000. The
+kernel's own address space was not translatable. The granule failure hid
+it, and it would have been the very next wall.
+
+That also decides the link address. No 4K setting covers the
+ARM_LARGE_MEMORY layout based at 0xffff_fe00_0000_0000, which needs 41
+significant bits, so DODGE overrides it back to the ordinary
+0xfffffff007004000 that T1SZ = 25 does cover.
+
+The framebuffer block descriptor is now masked with
+ARM_TTE_BLOCK_L2_MASK rather than built from a hardcoded base. An L2
+block is 32MB at 16K and 2MB at 4K, so 0xfc000000 was right for one page
+size and wrong for the other; masking is right for both, and still
+leaves the RES0 bits clear. Verified: 16K maps 0xfc000000 at index 126,
+4K maps 0xfc800000 at index 484, and the framebuffer is inside both.
+
+mkpayload drops PAGE to 0x1000 and rounds virt_base to a named L2_BLOCK
+rather than a literal 32MB, since that is what the congruence with
+phys_base is actually about.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ makedefs/MakeInc.def          | 12 ++++++++++++
+ osfmk/arm64/start.s           | 30 +++++++++++++++++-------------
+ pexpert/pexpert/arm64/DODGE.h | 25 +++++++++++++++++++++++--
+ 3 files changed, 52 insertions(+), 15 deletions(-)
+
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 649bd2a..14734dd 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -337,6 +337,18 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
+ 
++# DODGE builds with 4K pages, because the SM8750's Oryon cores do not implement
++# the 16K translation granule (ID_AA64MMFR0_EL1.TGran16 = 0, measured on both
++# core types). With 4K, xnu's T0SZ/T1SZ_BOOT is 25, a 39-bit TTBR1 that reaches
++# down to 0xffffff8000000000 and no further - it cannot address the
++# ARM_LARGE_MEMORY layout based at 0xffff_fe00_0000_0000. So this target uses
++# the ordinary kernel address space, whose link address that range does cover.
++ifeq ($(CURRENT_MACHINE_CONFIG),DODGE)
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
++
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+ 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 4d1cc1c..22cb7f0 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -750,24 +750,28 @@ Lkernelcache_base_found:
+ 
+ #if defined(DODGE)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * DODGE uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer: one Normal-NC L2 block in the EXISTING V=P L2
++	 * table. Framebuffer and RAM share an L1 entry (0xc0000000 and
++	 * 0xfc800000 are both in the 1GB entry 3 with 4K pages), so another
++	 * call to create_bootstrap_mapping would replace the RAM L2 table.
++	 * All bring-up RAM is below 4GB, so the first V=P L2 page is
++	 * bootstrap_pagetables + 2*PGBYTES.
+ 	 *
+-	 * Map the whole 32MB block the framebuffer lives in, 0xfc000000, not
+-	 * 0xfc800000: a block descriptor's output address field is bits[47:25],
+-	 * and the framebuffer sits 8MB into its block, so OR-ing its address in
+-	 * would have set bit 23 inside the descriptor's RES0 field [24:17].
+-	 * That is CONSTRAINED UNPREDICTABLE and a core is allowed to take a
+-	 * translation fault on it, which is exactly what this store must not do.
++	 * The output address is masked to the block, not OR-ed in whole. A
++	 * block descriptor's address field stops at ARM_TT_L2_SHIFT, and the
++	 * bits below it are RES0; setting them is CONSTRAINED UNPREDICTABLE and
++	 * a core may fault on the descriptor, which is exactly what this store
++	 * must not do. Masking with ARM_TTE_BLOCK_L2_MASK is also what keeps
++	 * this correct across page sizes - an L2 block is 32MB with 16K pages
++	 * and 2MB with 4K, so a base hardcoded for one is wrong for the other.
++	 * The index is taken before masking; both give the same entry.
+ 	 */
+-	MOV64	x10, 0xfc000000
++	MOV64	x10, 0xfc800000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+-	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
++	and		x10, x10, #(ARM_TTE_BLOCK_L2_MASK)
++	orr		x11, x11, x10
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+diff --git a/pexpert/pexpert/arm64/DODGE.h b/pexpert/pexpert/arm64/DODGE.h
+index ef028fd..501aee6 100644
+--- a/pexpert/pexpert/arm64/DODGE.h
++++ b/pexpert/pexpert/arm64/DODGE.h
+@@ -32,9 +32,30 @@
+ #define __ARM_VFP__               4
+ #define __ARM_COHERENT_CACHE__    1
+ #define __ARM_DEBUG__             7
+-#define __ARM_16K_PG__            1   /* Oryon supports the 16K translation granule */
++/*
++ * 4K pages, NOT 16K.
++ *
++ * Measured on the device, both core types, identical registers:
++ *   ID_AA64MMFR0_EL1 = 0x2100122100001024
++ *   TGran4  = 0 -> 4K supported        (0 means supported for this field)
++ *   TGran64 = 0 -> 64K supported
++ *   TGran16 = 0 -> 16K NOT implemented (0 means NOT supported for this field)
++ * The convention is inverted between those neighbouring fields, which is the
++ * easy thing to misread; TGran16_2 agrees, and Android runs this SoC on 4K.
++ *
++ * xnu is otherwise 16K-only, so with __ARM_16K_PG__ set TCR_EL1.TG0/TG1 held a
++ * reserved value and every translation faulted the instant SCTLR_EL1.M was
++ * set - the wall at boot-progress stage 6.
++ *
++ * __ARM64_PMAP_SUBPAGE_L1__ goes with it, and not only for tidiness: together
++ * with 16K it selected T0SZ/T1SZ = 25, a 39-bit TTBR1 covering only
++ * 0xffffff8000000000 and above, while the kernel links at 0xfffffe0007004000.
++ * The kernel's own address space was not translatable, which the granule
++ * failure hid. Without it, 4K gives T0SZ/T1SZ = 25 against the non-large-memory
++ * link address 0xfffffff007004000, which that range does cover - see the
++ * DODGE override of ARM64_LINK_ADDR in makedefs/MakeInc.def.
++ */
+ #define __ARM_PAN_AVAILABLE__     1
+-#define __ARM64_PMAP_SUBPAGE_L1__ 1   /* as BCM2837; revisit once VM is up */
+ 
+ /* No CPU_HAS_APPLE_PAC / HAS_PARAVIRTUALIZED_PAC: we build plain arm64 for now. */
+ 

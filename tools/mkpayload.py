@@ -32,7 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
-PAGE = 0x4000
+# dodge builds xnu with 4K pages: the SM8750's Oryon cores do not implement the
+# 16K translation granule (ID_AA64MMFR0_EL1.TGran16 = 0, measured on both core
+# types), so xnu's usual 16K is not available here.
+PAGE = 0x1000
+# An L2 block, which is what start.s maps the kernel with: 2MB at 4K pages,
+# 32MB at 16K. virt_base and phys_base must be congruent modulo this, or the
+# bootstrap KVA map resolves the kernel's own address to the wrong place.
+L2_BLOCK = 0x200000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
@@ -147,9 +154,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     segs = [s for s in m['segs'] if s['vmsize']]
     text = m['segs'][0]
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
-    # virt_base: 32MB (16K-granule L2 block) below the mach header, so start.s's
+    # virt_base: the start of the L2 block holding the mach header, so start.s's
     # block mapping that starts at the header's block begins exactly at phys_base.
-    virt_base = text['vmaddr'] & ~(0x2000000 - 1)
+    virt_base = text['vmaddr'] & ~(L2_BLOCK - 1)
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
