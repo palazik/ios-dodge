@@ -16,10 +16,27 @@ run the unmodified iOS userland — goes to dipa-studio. This fork adapts that m
   (Redmi Note 12), so a sibling of this project (both descend from dipa-studio). Its notes flagged a
   dangerous failure mode (an iOS UFS driver that wrote to LUN0 and destroyed its GPT); those safety
   rules are captured in **`RECOVERY.md`** and must be followed on `dodge`.
+- **[UniXNU/UniXNU](https://github.com/UniXNU/UniXNU)** — runs iOS and macOS on non-Apple ARM64 via
+  UEFI, and had already solved 4 KiB XNU before we needed it. **BSD-2-Clause-Patent**, so its patches
+  are reused under licence rather than reimplemented; they apply to our tree unmodified, both being
+  xnu-8796.141.3. We take `native-4k-bootstrap-capacity`, `native-4k-user-abi` and
+  `native-4k-signature-hash-cache` (patches `0039`-`0040`). Their
+  [four-k-page-tables](https://unixnu.com/xnu/four-k-page-tables) notes are the reference for this
+  port's page-size work.
+- **[blahajcoding/ios-lemonadep](https://github.com/blahajcoding/ios-lemonadep)** — ios-sweet on a
+  OnePlus 9 Pro, and the furthest along of the sibling forks (XNU to PID 1 with launchd). Patch
+  `0034` is theirs twice over: quiescing CNTV before handover, and not touching `CNTP_CTL_EL0`,
+  which EL1 may not own. Their notes also supplied the framebuffer-alias warning recorded in
+  `NOTES.md`.
+- **[KSN2redawew/ios-giuliac](https://github.com/KSN2redawew/ios-giuliac)** — a fork of this
+  repository for a OnePlus Ace 5. Found the 32 MB `PHYS_BASE` alignment bug that made our kernel's
+  own KVA resolve to the wrong place, and the local-TLB-flush fix in `0029`. On-screen fault
+  reporting (`0028`) and colour-coded progress stripes (`0030`) are their ideas.
 
-> Status: **the XNU kernel now builds from source for `dodge`** (plain arm64, no PAC, `NO_MONITOR`,
-> GICv3, 16K — a fully-linked `kernel.development.dodge` Mach-O). Boot bring-up is next; nothing boots
-> to iOS yet. **Before any on-device test, read `RECOVERY.md`.**
+> Status: **XNU boots far enough to switch on the MMU and survive it.** Built from source for
+> `dodge` (plain arm64, no PAC, `NO_MONITOR`, GICv3, **4 KiB pages** — the SM8750's Oryon cores do
+> not implement the 16 KiB translation granule, measured on both core types). Nothing boots to iOS
+> yet. **Before any on-device test, read `RECOVERY.md`.**
 
 ## Layout
 - **`dodge/`** — our OnePlus 13 work (new):

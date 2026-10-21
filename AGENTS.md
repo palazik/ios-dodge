@@ -44,3 +44,14 @@ commands, and the safe boot-args (no `ufsrw`/`rootrw`).
 
 ## Hygiene
 Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+
+## Commit messages
+
+Conventional-commit prefixes: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`,
+`build:`, `test:`. Not `dodge:` — this repository only targets one device, so
+naming it in every subject line says nothing. Patches 0001-0040 predate this
+and are left alone rather than rewritten.
+
+Use a scope only when it narrows something real, e.g. `fix(shim):`,
+`feat(ufs):`. The body should say why, and distinguish what was measured on the
+device from what was inferred.
