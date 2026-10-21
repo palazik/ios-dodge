@@ -1,0 +1,52 @@
+From 646c886ac68407f34f05985102d4b68c3b53678a Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 11:47:44 +0500
+Subject: [PATCH] dodge: use the iOS user address space, not the macOS one
+
+First real fallout from the 4K switch, caught by a static assertion
+rather than at runtime:
+
+  pmap.c:10987: (_COMM_PAGE64_BASE_ADDRESS & ~ARM_TT_L1_OFFMASK)
+                >= MACH_VM_MAX_ADDRESS
+
+The commpage sits at 64GB-16K, so with 4K pages it rounds down to 63GB
+and must still be above the top of the user address space. It is not,
+because building as a MacOSX platform target selects a 127TB user VA -
+which this configuration cannot represent anyway: that needs 47 bits
+(T0SZ 17), and 4K here gives T0SZ 25, a 39-bit 512GB space.
+
+We build as MacOSX only to get the right SDK; the target is a phone. So
+take the value the non-MacOSX branch already has, 63GB, which fits the
+39-bit space and satisfies the assertion. The iOS userland we intend to
+run expects that layout regardless.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/mach/arm/vm_param.h | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..6b866c9 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,19 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++#if defined(ARM64_BOARD_CONFIG_DODGE)
++/*
++ * dodge is a phone, and builds with 4K pages because its Oryon cores do not
++ * implement the 16K granule. It is only built as a MacOSX platform target to
++ * get the right SDK, so take the iOS user address space rather than the macOS
++ * one, which this configuration cannot represent: the macOS 127TB value needs
++ * a 47-bit user VA (T0SZ 17), while 4K here gives T0SZ 25, a 39-bit 512GB
++ * space. It also breaks the commpage invariant that pmap.c asserts for 4K -
++ * _COMM_PAGE64_BASE_ADDRESS sits at 64GB, so it cannot nest above a 127TB
++ * user VA, and the build fails there rather than silently later.
++ */
++#define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
++#elif defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
