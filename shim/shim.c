@@ -199,54 +199,47 @@ void secondary_main(uint64_t idx)
 }
 
 /*
- * Does ANY core implement the 16K translation granule?
+ * Does a PRIME core implement the 16K translation granule?
  *
  * xnu is built for 16K pages, and the boot core reports
- * ID_AA64MMFR0_EL1.TGran16 == 0, which for this field means "not
- * implemented" (the neighbouring TGran4/TGran64 fields use the opposite
- * convention, where 0 means supported). That is why xnu dies the instant it
- * sets SCTLR_EL1.M. A big.LITTLE SoC is architecturally allowed to differ
- * here between clusters, and the two prime cores have never been read, so
- * start every core by its real MPIDR and collect TGran16 from each.
+ * ID_AA64MMFR0_EL1.TGran16 == 0, which for this field means "not implemented"
+ * (the neighbouring TGran4/TGran64 fields use the opposite convention, where 0
+ * means supported). That is why xnu dies the instant it sets SCTLR_EL1.M. A
+ * big.LITTLE SoC is architecturally allowed to differ between clusters, and the
+ * prime cores have never been read.
  *
- * One line, one nibble per core, cpu7 leftmost:
- *   tg16  - 0 means that core cannot do 16K; 1 or 2 means it can.
- *           F means the core never reported (see the CPU_ON return).
- *   on    - bitmask of cores that answered.
+ * The first version of this started all seven secondaries in a loop with no
+ * output in between, and it HUNG the shim: the screen stopped after MMFR0 and
+ * the handover never happened. PSCI CPU_ON has never actually run on this
+ * device - the old test_smp() is dead code - so it cannot be assumed to work.
+ *
+ * So: one core, not seven, and a printed marker on both sides of every step
+ * that could block. The boot core already answered and the five other
+ * performance cores are the same design as it, so the only question left is
+ * the prime cluster, and cpu6 answers it. A hang now costs one line of output
+ * instead of the whole boot, and the last line on screen names what blocked.
  */
 static void probe_granule(void)
 {
-	uint64_t self = rsr("mpidr_el1") & 0xffffff;
-	uint32_t tg = 0, on = 0, err = 0;
-
 	stage = "granule";
-	for (int i = 0; i < NR_CPUS; i++) {
-		if (cpu_mpidr[i] == self) {
-			continue;
-		}
-		int64_t rc = smc(PSCI_CPU_ON, cpu_mpidr[i],
-		    (uintptr_t)secondary_entry, i);
-		err |= (uint32_t)(rc & 0xf) << (4 * i);
-	}
-	delay_ms(500);
 
-	for (int i = 0; i < NR_CPUS; i++) {
-		uint64_t mmfr0;
+	con_hex2("PROBE", "prime=", cpu_mpidr[6],
+	    "entry=", (uint32_t)(uintptr_t)secondary_entry);
 
-		if (cpu_mpidr[i] == self) {
-			mmfr0 = rsr("id_aa64mmfr0_el1");
-		} else if (sec_mpidr[i]) {
-			mmfr0 = sec_mmfr0[i];
-		} else {
-			tg |= 0xfU << (4 * i);	/* never reported */
-			continue;
-		}
-		on |= 1U << i;
-		tg |= (uint32_t)((mmfr0 >> 20) & 0xf) << (4 * i);
+	int64_t rc = smc(PSCI_CPU_ON, cpu_mpidr[6], (uintptr_t)secondary_entry, 6);
+	con_hex2("CPUON", "rc=", (uint32_t)rc, 0, 0);
+
+	delay_ms(300);
+	con_str("PROBE", "delay done");
+
+	if (sec_mpidr[6]) {
+		con_hex2("PRIME", "tg16=", (uint32_t)((sec_mmfr0[6] >> 20) & 0xf),
+		    "mpidr=", (uint32_t)sec_mpidr[6]);
+		con_hex("PRIME MMFR0", sec_mmfr0[6]);
+	} else {
+		con_str("PRIME", "core 6 never reported");
 	}
-	con_hex2("TG16", "cpu7..0=", tg, "on=", on);
-	con_hex2("CPUON", "err7..0=", err, "boot=", (uint32_t)self);
-	delay_ms(200);		/* let the secondaries reach PSCI_CPU_OFF */
+	delay_ms(200);		/* let it reach PSCI_CPU_OFF */
 }
 
 static void __attribute__((unused)) test_smp(void)
