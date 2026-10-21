@@ -1,0 +1,103 @@
+From 1df8949b93e307056e1c33f5faf638313ea893e0 Mon Sep 17 00:00:00 2001
+From: palazik <gochmyradov0@gmail.com>
+Date: Wed, 21 Oct 2026 12:13:07 +0500
+Subject: [PATCH] dodge: stage 8 asks the hardware, and the fault report keeps
+ the stripes
+
+Two changes so the next boot answers the stage-8 question instead of
+hanging on it.
+
+Stage 8 used to store to the framebuffer with the MMU on and hope. Now it
+runs AT S1E1W on the framebuffer address and reads PAR_EL1, which
+performs the EL1 write translation and reports it without touching
+memory, so neither answer can hang. The stripe is then drawn with the MMU
+off, the way every stripe before it is drawn: lime when PAR_EL1.F is 0
+and the V=P framebuffer block translates, purple when it does not. One
+colour, one fact, no silence.
+
+The fault report also moved down the panel. It cleared from row 800,
+which is below the shim's text but above the stripes at 1200..1552 - so a
+report would have erased the very stripe that explains why it happened.
+It now starts at row 49 (pixel 1568), clear of both, with 50 text rows
+left below.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ osfmk/arm64/dodge_early.c | 14 +++++++++-----
+ osfmk/arm64/start.s       | 27 +++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/arm64/dodge_early.c b/osfmk/arm64/dodge_early.c
+index 767ee5b..28be42a 100644
+--- a/osfmk/arm64/dodge_early.c
++++ b/osfmk/arm64/dodge_early.c
+@@ -172,12 +172,16 @@ dodge_early_ec(uint64_t esr)
+  * on screen by patching the built kernel; this is the same thing in source.
+  */
+ /*
+- * Text rows left untouched at the top of the panel. The shim's handover text
+- * lives there - the CPU facts, the load addresses and the VERIFY line - and
+- * that is context for the fault, so painting over it loses more than it gains.
+- * Keeping it is an idea from KSN2redawew/ios-giuliac (commit 227b31c4).
++ * Rows left untouched at the top of the panel, in text rows of EARLY_CELL_H.
++ * Two things live above this line and both are context for a fault, so
++ * painting over them loses more than the blue background gains: the shim's
++ * handover text (CPU facts, load addresses, VERIFY) in roughly the first 800
++ * pixels, and start.s's boot-progress stripes, which end at
++ * DODGE_BAND_ROW0 + 8*40 + 32 = row 1552. 1552/EARLY_CELL_H is 48.5, so the
++ * report starts at row 49 and the stripe that led to it stays on screen.
++ * Keeping the text is an idea from KSN2redawew/ios-giuliac (commit 227b31c4).
+  */
+-#define EARLY_EXC_TOP_ROW 25u
++#define EARLY_EXC_TOP_ROW 49u
+ 
+ void
+ dodge_early_exception(unsigned int slot, uint64_t esr, uint64_t far,
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 430316f..2d4b7e3 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -132,6 +132,7 @@
+ #define DODGE_C6 0xff0000ff	/* blue    */
+ #define DODGE_C7 0xff808080	/* grey    */
+ #define DODGE_C8 0xff80ff00	/* lime    */
++#define DODGE_CFAIL 0xff8000ff	/* purple: stage 8 could not translate */
+ 
+ .macro DODGE_BAND
+ 	MOV64	x0, (0xfc800000 + (DODGE_BAND_ROW0 + $0 * 40) * 5760)
+@@ -993,9 +994,35 @@ common_start:
+ 	msr		SCTLR_EL1, x4
+ 	isb		sy
+ 	DODGE_BAND 7, DODGE_C7
++
++	/*
++	 * Stage 8 asks the hardware whether the framebuffer translates with the
++	 * MMU on, instead of finding out by storing to it and faulting. AT
++	 * S1E1W runs the EL1 write translation and reports through PAR_EL1
++	 * without touching memory, so neither answer can hang: PAR_EL1.F is 0
++	 * when the translation succeeded and 1 when it faulted, and the stripe
++	 * is drawn with the MMU off either way, the way every stripe before it
++	 * was drawn.
++	 *
++	 *   lime   - the framebuffer block in the V=P bootstrap table works.
++	 *   purple - it does not, and that is the next thing to fix.
++	 */
+ 	msr		SCTLR_EL1, x3
+ 	isb		sy
++	MOV64	x5, 0xfc800000
++	at		s1e1w, x5
++	isb
++	mrs		x5, PAR_EL1
++	msr		SCTLR_EL1, x4
++	isb		sy
++	tbz		x5, #0, 1f
++	DODGE_BAND 8, DODGE_CFAIL
++	b		2f
++1:
+ 	DODGE_BAND 8, DODGE_C8
++2:
++	msr		SCTLR_EL1, x3
++	isb		sy
+ 	mov		x0, x3
+ #endif
+ 
